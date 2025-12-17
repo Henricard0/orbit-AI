@@ -18,8 +18,17 @@ interface Message {
 
 type Mode = 'chat' | 'voice';
 
+const EXERCISES = [
+  { id: 'roleplay_cafe', label: '☕ Roleplay: Café', prompt: 'Vamos fazer um roleplay. Você é o garçom e eu sou o cliente em um café.' },
+  { id: 'roleplay_hotel', label: '🏨 Roleplay: Hotel', prompt: 'Vamos fazer um roleplay. Eu estou tentando fazer check-in no seu hotel e tive um problema.' },
+  { id: 'vocab_travel', label: '✈️ Vocabulário: Viagem', prompt: 'Me ensine 5 palavras úteis sobre viagens e depois me teste.' },
+  { id: 'pronunciation', label: '🗣️ Pronúncia', prompt: 'Me dê uma frase difícil para praticar a pronúncia e corrija meu sotaque.' },
+  { id: 'grammar', label: '📖 Gramática: Passado', prompt: 'Me faça perguntas sobre o que eu fiz ontem para praticar o tempo passado.' },
+];
+
 export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
   const [mode, setMode] = useState<Mode>('chat');
+  const [showExercises, setShowExercises] = useState(false);
 
   // --- CHAT STATE ---
   const [messages, setMessages] = useState<Message[]>([]);
@@ -113,6 +122,28 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
   };
 
   // =========================================================
+  // LOGIC: EXERCISES
+  // =========================================================
+
+  const handleStartExercise = (prompt: string) => {
+    setShowExercises(false);
+    
+    if (mode === 'chat') {
+      // Send directly as a message
+      setInputText(prompt); // Visual feedback
+      setTimeout(() => handleSendMessage(prompt), 100);
+    } else {
+      // In Voice mode, we can't easily inject text into the audio stream without a complex setup.
+      // Instead, we show a 'Suggestion' bubble to the user to read out loud.
+      setVoiceMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        role: 'user',
+        text: `(Sugestão: Diga) "${prompt}"`
+      }]);
+    }
+  };
+
+  // =========================================================
   // MODE 1: CHAT (TEXT)
   // =========================================================
 
@@ -126,6 +157,12 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
       2. Use Português para explicar conceitos difíceis ou correções se o aluno estiver confuso.
       3. Se o aluno escrever em Português, responda misturando os dois idiomas para ajudar na compreensão.
       4. Corrija erros gramaticais gentilmente.
+
+      EXERCÍCIOS:
+      Se o aluno pedir um exercício (Roleplay, Vocabulário, Pronúncia):
+      - Inicie imediatamente.
+      - Para Roleplay: Defina o cenário e comece sua fala como personagem.
+      - Para Vocabulário: Ensine e depois faça perguntas.
     `;
 
     chatSessionRef.current = ai.chats.create({
@@ -147,18 +184,18 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
     }
   }, [mode, initChat, messages.length]);
 
-  const handleSendMessage = async () => {
-    if (!inputText.trim() || !chatSessionRef.current) return;
+  const handleSendMessage = async (textOverride?: string) => {
+    const textToSend = textOverride || inputText;
+    if (!textToSend.trim() || !chatSessionRef.current) return;
 
-    const userText = inputText;
-    setInputText(''); 
+    if (!textOverride) setInputText(''); 
     setIsTyping(true);
 
     const tempId = Date.now().toString() + Math.random().toString();
-    setMessages(prev => [...prev, { id: tempId, role: 'user', text: userText }]);
+    setMessages(prev => [...prev, { id: tempId, role: 'user', text: textToSend }]);
 
     try {
-      const result: GenerateContentResponse = await chatSessionRef.current.sendMessage({ message: userText });
+      const result: GenerateContentResponse = await chatSessionRef.current.sendMessage({ message: textToSend });
       const responseText = result.text;
       
       setMessages(prev => [...prev, { 
@@ -244,7 +281,14 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                      - However, if the student is struggling or asks for help, use Portuguese to clarify concepts.
                      - You can mix sentences like: "In ${language.nativeName}, we use this verb... (explanation in PT)... now try saying [phrase in ${language.nativeName}]."
 
-                  4. **TONE**: Encouraging, patient, but strict about accuracy.
+                  4. **EXERCISES & ROLEPLAY**:
+                     - If the user says "Vamos fazer um roleplay" or asks for an exercise:
+                     - **Roleplay**: Set the scene (e.g., Cafe, Hotel), define your role (e.g., Waiter), and start.
+                     - **Vocabulary**: Give a word, ask for the definition or translation.
+                     - **Pronunciation**: Give a tongue twister or difficult sentence.
+                     - Keep the turns short and interactive.
+
+                  5. **TONE**: Encouraging, patient, but strict about accuracy.
                 `,
                 inputAudioTranscription: {}, 
                 outputAudioTranscription: {}, 
@@ -496,21 +540,57 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
               </div>
           </div>
           
-          {/* Mode Toggle */}
-          <div className="flex bg-black/40 rounded-full p-1 backdrop-blur-sm border border-white/10">
-             <button 
-                onClick={() => switchMode('chat')}
-                className={`px-4 py-2 rounded-full text-xs font-bold transition-all ${mode === 'chat' ? 'bg-white text-black shadow-lg' : 'text-gray-400 hover:text-white'}`}
-             >
-                Escrever
-             </button>
-             <button 
-                onClick={() => switchMode('voice')}
-                className={`px-4 py-2 rounded-full text-xs font-bold transition-all flex items-center gap-2 ${mode === 'voice' ? 'bg-white text-black shadow-lg' : 'text-gray-400 hover:text-white'}`}
-             >
-                Falar
-                {mode === 'chat' && <div className="scale-75"><Icons.Mic /></div>} 
-             </button>
+          {/* Controls */}
+          <div className="flex items-center gap-3">
+              {/* Exercise Menu */}
+              <div className="relative">
+                <button 
+                  onClick={() => setShowExercises(!showExercises)}
+                  className={`p-2.5 rounded-full transition-all border ${showExercises ? 'bg-orbit-primary text-white border-orbit-primary shadow-[0_0_15px_rgba(168,85,247,0.4)]' : 'bg-black/40 text-gray-400 border-white/10 hover:text-white'}`}
+                  title="Exercícios"
+                >
+                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6.5 6.5 11 11"/><path d="m21 21-1-1"/><path d="m3 3 1 1"/><path d="m18 22 4-4"/><path d="m2 6 4-4"/><path d="m3 10 7-7"/><path d="m14 21 7-7"/></svg>
+                </button>
+                
+                {/* Exercise Dropdown */}
+                {showExercises && (
+                   <div className="absolute top-full right-0 mt-3 w-64 bg-[#1a1a1a] border border-white/10 rounded-xl shadow-2xl p-2 z-50 animate-in fade-in zoom-in-95">
+                      <div className="text-xs font-bold text-gray-500 uppercase px-2 py-2">Atividades Práticas</div>
+                      <div className="space-y-1">
+                        {EXERCISES.map(ex => (
+                          <button
+                             key={ex.id}
+                             onClick={() => handleStartExercise(ex.prompt)}
+                             className="w-full text-left px-3 py-2.5 rounded-lg hover:bg-white/5 text-sm text-gray-200 transition-colors flex items-center gap-2"
+                          >
+                             {ex.label}
+                          </button>
+                        ))}
+                      </div>
+                   </div>
+                )}
+                {/* Overlay to close menu */}
+                {showExercises && (
+                    <div className="fixed inset-0 z-40 bg-transparent" onClick={() => setShowExercises(false)}></div>
+                )}
+              </div>
+
+              {/* Mode Toggle */}
+              <div className="flex bg-black/40 rounded-full p-1 backdrop-blur-sm border border-white/10">
+                 <button 
+                    onClick={() => switchMode('chat')}
+                    className={`px-4 py-2 rounded-full text-xs font-bold transition-all ${mode === 'chat' ? 'bg-white text-black shadow-lg' : 'text-gray-400 hover:text-white'}`}
+                 >
+                    Escrever
+                 </button>
+                 <button 
+                    onClick={() => switchMode('voice')}
+                    className={`px-4 py-2 rounded-full text-xs font-bold transition-all flex items-center gap-2 ${mode === 'voice' ? 'bg-white text-black shadow-lg' : 'text-gray-400 hover:text-white'}`}
+                 >
+                    Falar
+                    {mode === 'chat' && <div className="scale-75"><Icons.Mic /></div>} 
+                 </button>
+              </div>
           </div>
       </div>
 
@@ -564,7 +644,7 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                               className="w-full bg-[#151515] border border-white/10 rounded-xl pl-5 pr-12 py-4 text-white placeholder-gray-600 focus:outline-none focus:border-purple-500 transition-colors disabled:opacity-50"
                           />
                           <button 
-                            onClick={handleSendMessage}
+                            onClick={() => handleSendMessage()}
                             disabled={!inputText.trim() || isTyping}
                             className="absolute right-2 top-2 bottom-2 aspect-square bg-white text-black rounded-lg flex items-center justify-center hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                           >
