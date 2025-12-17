@@ -13,7 +13,7 @@ interface Message {
   id: string;
   role: 'user' | 'model';
   text: string;
-  isCorrection?: boolean;
+  correction?: string; // Holds the grammar correction if applicable
 }
 
 type Mode = 'chat' | 'voice';
@@ -34,8 +34,16 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
   
   // Voice Transcript State
   const [voiceMessages, setVoiceMessages] = useState<Message[]>([]);
+  
+  // We use refs to track live text inside the callback to avoid stale closures
+  // and to implement "Commit on Speaker Switch" logic.
+  const liveUserTextRef = useRef('');
+  const liveModelTextRef = useRef('');
+  
+  // We also need state to trigger re-renders when text updates
   const [currentLiveUserText, setCurrentLiveUserText] = useState('');
   const [currentLiveModelText, setCurrentLiveModelText] = useState('');
+  
   const voiceScrollRef = useRef<HTMLDivElement>(null);
 
   // --- REFS ---
@@ -67,6 +75,42 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
   useEffect(() => {
     scrollToBottom();
   }, [messages, isTyping, mode, voiceMessages, currentLiveUserText, currentLiveModelText]);
+
+  // =========================================================
+  // HELPER: SPEECH ANALYSIS
+  // =========================================================
+  
+  const analyzeSpeech = async (text: string, messageId: string) => {
+    if (!text || text.length < 3) return;
+
+    try {
+      // We use a lightweight separate request to check grammar without interrupting the live flow
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: `
+          Analyze this sentence spoken by a Portuguese learner of ${language.nativeName}: "${text}".
+          
+          If there are grammatical or vocabulary errors, return a concise correction and explanation in Portuguese.
+          Format: "Correção: [Corrected Sentence] - [Brief Explanation]"
+          
+          If the sentence is correct or naturally conversational, return exactly "OK".
+        `,
+        config: {
+          temperature: 0.1,
+        }
+      });
+
+      const result = response.text?.trim();
+
+      if (result && result !== "OK" && !result.includes("OK")) {
+        setVoiceMessages(prev => 
+          prev.map(msg => msg.id === messageId ? { ...msg, correction: result } : msg)
+        );
+      }
+    } catch (e) {
+      console.error("Analysis failed", e);
+    }
+  };
 
   // =========================================================
   // MODE 1: CHAT (TEXT)
@@ -110,21 +154,22 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
     setInputText(''); 
     setIsTyping(true);
 
-    setMessages(prev => [...prev, { id: Date.now().toString(), role: 'user', text: userText }]);
+    const tempId = Date.now().toString() + Math.random().toString();
+    setMessages(prev => [...prev, { id: tempId, role: 'user', text: userText }]);
 
     try {
       const result: GenerateContentResponse = await chatSessionRef.current.sendMessage({ message: userText });
       const responseText = result.text;
       
       setMessages(prev => [...prev, { 
-        id: (Date.now() + 1).toString(), 
+        id: (Date.now() + 1).toString() + Math.random().toString(), 
         role: 'model', 
         text: responseText || "Não entendi, pode repetir?" 
       }]);
     } catch (error) {
       console.error("Chat Error", error);
       setMessages(prev => [...prev, { 
-        id: Date.now().toString(), 
+        id: Date.now().toString() + Math.random().toString(), 
         role: 'model', 
         text: "Tive um problema de conexão. Tente novamente." 
       }]);
@@ -181,20 +226,26 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                 speechConfig: {
                     voiceConfig: { prebuiltVoiceConfig: { voiceName: language.voiceName } },
                 },
-                // INSTRUCTION FOR BILINGUAL SUPPORT
                 systemInstruction: `
-                  You are a bilingual language tutor. 
-                  Target Language: ${language.nativeName}.
-                  User Language: Portuguese.
-                  
-                  Role: Engage the user in conversation to teach ${language.nativeName}.
-                  Behavior:
-                  1. Speak primarily in ${language.nativeName} if the user is advanced.
-                  2. If the user speaks Portuguese, mix ${language.nativeName} and Portuguese to help them understand. 
-                  3. If the user makes a mistake, provide the correction in Portuguese, then say the correct phrase in ${language.nativeName} for them to repeat.
-                  4. Keep responses concise and conversational.
+                  You are an expert native tutor of ${language.nativeName} teaching a student who speaks Portuguese.
+
+                  YOUR BEHAVIORAL RULES:
+                  1. **VERBAL CORRECTION (PRIORITY)**: 
+                     - If the user makes a pronunciation or grammar mistake, you MUST correct them verbally immediately at the start of your response.
+                     - Example: "Ah, cuidado. A pronúncia correta é [Correct Word], não [Wrong Word]." or "Dizemos [Correct Phrase]."
+                     - Do this politely but explicitly before continuing the conversation.
+
+                  2. **LANGUAGE SWITCHING**:
+                     - If the user asks to "explain in Portuguese" or "fale em português", you MUST switch to Portuguese immediately to provide the explanation. 
+                     - Do not just say "Sim, posso explicar". Actually provide the explanation in Portuguese.
+
+                  3. **BILINGUAL MIXING**: 
+                     - Default to speaking ${language.nativeName} to immerse the student.
+                     - However, if the student is struggling or asks for help, use Portuguese to clarify concepts.
+                     - You can mix sentences like: "In ${language.nativeName}, we use this verb... (explanation in PT)... now try saying [phrase in ${language.nativeName}]."
+
+                  4. **TONE**: Encouraging, patient, but strict about accuracy.
                 `,
-                // Enable transcription for both sides
                 inputAudioTranscription: {}, 
                 outputAudioTranscription: {}, 
             },
@@ -203,7 +254,6 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                     setIsConnected(true);
                     setVoiceStatus('Conectado. Pode falar!');
                     isConnectingRef.current = false;
-                    // Initial prompt in history
                     setVoiceMessages([{
                         id: 'start', 
                         role: 'model', 
@@ -211,7 +261,7 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                     }]);
                 },
                 onmessage: async (message: LiveServerMessage) => {
-                    // Audio Playback
+                    // --- 1. Audio Playback ---
                     const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
                     if (base64Audio && outputAudioContextRef.current) {
                         const ctx = outputAudioContextRef.current;
@@ -228,35 +278,71 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                         sourcesRef.current.add(source);
                     }
 
-                    // Handling Transcription
+                    // --- 2. Transcription & Interleaving Logic ---
+                    
                     const inTrans = message.serverContent?.inputTranscription?.text;
                     if (inTrans) {
-                        setCurrentLiveUserText(prev => prev + inTrans);
+                        // User is speaking. 
+                        // If AI had pending text, commit it to history NOW to ensure strict User-after-AI order.
+                        if (liveModelTextRef.current.trim()) {
+                            const textToCommit = liveModelTextRef.current;
+                            setVoiceMessages(prev => [...prev, { id: Date.now() + '_m_interrupt', role: 'model', text: textToCommit }]);
+                            liveModelTextRef.current = '';
+                            setCurrentLiveModelText('');
+                        }
+                        
+                        // Append to current user text
+                        liveUserTextRef.current += inTrans;
+                        setCurrentLiveUserText(liveUserTextRef.current);
                     }
 
                     const outTrans = message.serverContent?.outputTranscription?.text;
                     if (outTrans) {
-                        setCurrentLiveModelText(prev => prev + outTrans);
+                        // AI is speaking.
+                        // If User had pending text, commit it to history NOW to ensure strict AI-after-User order.
+                        if (liveUserTextRef.current.trim()) {
+                            const textToCommit = liveUserTextRef.current;
+                            const msgId = Date.now() + '_u_interrupt';
+                            setVoiceMessages(prev => [...prev, { id: msgId, role: 'user', text: textToCommit }]);
+                            
+                            // Trigger Analysis for interrupted user speech
+                            analyzeSpeech(textToCommit, msgId);
+
+                            liveUserTextRef.current = '';
+                            setCurrentLiveUserText('');
+                        }
+
+                        // Append to current model text
+                        liveModelTextRef.current += outTrans;
+                        setCurrentLiveModelText(liveModelTextRef.current);
                         setVoiceStatus("Falando...");
                     }
 
-                    // Turn Complete: Commit text to history
+                    // --- 3. Turn Complete ---
                     if (message.serverContent?.turnComplete) {
-                        setVoiceMessages(prev => {
-                            const newMsgs = [...prev];
-                            // If we have accumulated user text, add it
-                            if (currentLiveUserText.trim()) {
-                                newMsgs.push({ id: Date.now() + '_u', role: 'user', text: currentLiveUserText });
-                                setCurrentLiveUserText('');
-                            }
-                            // If we have accumulated model text, add it
-                            if (currentLiveModelText.trim()) {
-                                newMsgs.push({ id: Date.now() + '_m', role: 'model', text: currentLiveModelText });
-                                setCurrentLiveModelText('');
-                            }
-                            return newMsgs;
-                        });
-                        setVoiceStatus('Sua vez...');
+                        // Commit whatever is in the refs to history
+                        if (liveUserTextRef.current.trim()) {
+                            const text = liveUserTextRef.current;
+                            const msgId = Date.now() + '_u';
+                            setVoiceMessages(prev => [...prev, { id: msgId, role: 'user', text }]);
+                            
+                            // Trigger Analysis for completed user speech
+                            analyzeSpeech(text, msgId);
+
+                            liveUserTextRef.current = '';
+                            setCurrentLiveUserText('');
+                        }
+                        
+                        if (liveModelTextRef.current.trim()) {
+                            const text = liveModelTextRef.current;
+                            setVoiceMessages(prev => [...prev, { id: Date.now() + '_m', role: 'model', text }]);
+                            liveModelTextRef.current = '';
+                            setCurrentLiveModelText('');
+                        }
+                        
+                        if (!outTrans && !inTrans) {
+                            setVoiceStatus('Sua vez...');
+                        }
                     }
 
                     if (message.serverContent?.interrupted) {
@@ -264,6 +350,13 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                         sourcesRef.current.clear();
                         nextStartTimeRef.current = 0;
                         setVoiceStatus('Interrompido');
+                        
+                        // Commit partials on interrupt if needed
+                        if (liveModelTextRef.current.trim()) {
+                             setVoiceMessages(prev => [...prev, { id: Date.now() + '_m_int', role: 'model', text: liveModelTextRef.current }]);
+                             liveModelTextRef.current = '';
+                             setCurrentLiveModelText('');
+                        }
                     }
                 },
                 onclose: () => {
@@ -351,6 +444,8 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
       setIsConnected(false);
       setIsMicOn(false);
       setVoiceMessages([]);
+      liveUserTextRef.current = '';
+      liveModelTextRef.current = '';
       setCurrentLiveUserText('');
       setCurrentLiveModelText('');
   };
@@ -370,11 +465,23 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
       setMode(newMode);
   };
 
+  // Helper to unify messages for rendering
+  const getDisplayMessages = () => {
+      const display = [...voiceMessages];
+      if (currentLiveUserText) {
+          display.push({ id: 'live_user', role: 'user', text: currentLiveUserText });
+      }
+      if (currentLiveModelText) {
+          display.push({ id: 'live_model', role: 'model', text: currentLiveModelText });
+      }
+      return display;
+  };
+
   return (
-    <div className="flex flex-col h-full bg-[#0a0a0a] rounded-none border-0 overflow-hidden relative">
+    <div className="flex flex-col h-full bg-[#0a0a0a] rounded-none border-0 overflow-hidden relative items-center">
       
       {/* --- HEADER --- */}
-      <div className={`h-20 flex items-center justify-between px-6 border-b border-white/5 transition-colors duration-500 z-30 relative bg-[#121212]`}>
+      <div className={`h-20 w-full flex items-center justify-between px-6 border-b border-white/5 transition-colors duration-500 z-30 relative bg-[#121212]`}>
           <div className="flex items-center gap-4">
               <button onClick={onExit} className="p-2 -ml-2 hover:bg-white/10 rounded-full transition-colors text-gray-400 hover:text-white">
                   <Icons.ArrowLeft />
@@ -408,59 +515,69 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
       </div>
 
       {/* --- BODY --- */}
-      <div className="flex-1 relative overflow-hidden flex flex-col z-10 bg-[#0a0a0a]">
+      <div className="flex-1 w-full relative overflow-hidden flex flex-col items-center z-10 bg-[#0a0a0a]">
           
-          {/* VIEW: CHAT (TEXT MODE) */}
-          <div className={`absolute inset-0 flex flex-col transition-all duration-500 z-20 ${mode === 'chat' ? 'translate-x-0 opacity-100' : '-translate-x-full opacity-0 pointer-events-none'}`}>
-              <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                  {messages.map((msg) => (
-                      <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                          <div className={`max-w-[80%] rounded-2xl px-5 py-3 text-sm leading-relaxed shadow-lg ${
-                              msg.role === 'user' 
-                              ? 'bg-white text-black rounded-tr-none' 
-                              : 'bg-[#1a1a1a] text-gray-200 border border-white/10 rounded-tl-none'
-                          }`}>
-                              {msg.text}
-                          </div>
+          {/* VIEW: CHAT (TEXT MODE) - CENTRALLY CONSTRAINED */}
+          <div className={`absolute inset-0 flex flex-col items-center transition-all duration-300 z-20 ${mode === 'chat' ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}>
+              
+              {/* Central Column Container */}
+              <div className="w-full max-w-3xl flex flex-col h-full bg-[#0a0a0a] border-x border-white/5 relative shadow-2xl">
+                  
+                  {/* Messages Area - Bottom Anchored */}
+                  <div className="flex-1 overflow-y-auto p-4 custom-scrollbar flex flex-col">
+                      <div className="flex-grow min-h-0"></div> {/* Spacer to push content to bottom */}
+                      <div className="space-y-4">
+                          {messages.map((msg) => (
+                              <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                                  <div className={`max-w-[80%] rounded-2xl px-5 py-3 text-sm leading-relaxed shadow-lg ${
+                                      msg.role === 'user' 
+                                      ? 'bg-white text-black rounded-tr-none' 
+                                      : 'bg-[#1a1a1a] text-gray-200 border border-white/10 rounded-tl-none'
+                                  }`}>
+                                      {msg.text}
+                                  </div>
+                              </div>
+                          ))}
+                          {isTyping && (
+                              <div className="flex justify-start">
+                                  <div className="bg-[#1a1a1a] rounded-2xl rounded-tl-none px-4 py-3 flex gap-1 border border-white/10">
+                                      <span className="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce"></span>
+                                      <span className="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce delay-100"></span>
+                                      <span className="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce delay-200"></span>
+                                  </div>
+                              </div>
+                          )}
                       </div>
-                  ))}
-                  {isTyping && (
-                      <div className="flex justify-start">
-                          <div className="bg-[#1a1a1a] rounded-2xl rounded-tl-none px-4 py-3 flex gap-1 border border-white/10">
-                              <span className="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce"></span>
-                              <span className="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce delay-100"></span>
-                              <span className="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce delay-200"></span>
-                          </div>
-                      </div>
-                  )}
-                  <div ref={messagesEndRef} />
-              </div>
+                      <div ref={messagesEndRef} />
+                  </div>
 
-              {/* Input Area */}
-              <div className="p-4 border-t border-white/5 bg-[#0a0a0a] pb-6">
-                  <div className="relative max-w-4xl mx-auto">
-                      <input 
-                          type="text" 
-                          value={inputText}
-                          onChange={(e) => setInputText(e.target.value)}
-                          onKeyDown={handleKeyPress}
-                          disabled={isTyping}
-                          placeholder={`Escreva algo em ${language.name}...`}
-                          className="w-full bg-[#151515] border border-white/10 rounded-xl pl-5 pr-12 py-4 text-white placeholder-gray-600 focus:outline-none focus:border-purple-500 transition-colors disabled:opacity-50"
-                      />
-                      <button 
-                        onClick={handleSendMessage}
-                        disabled={!inputText.trim() || isTyping}
-                        className="absolute right-2 top-2 bottom-2 aspect-square bg-white text-black rounded-lg flex items-center justify-center hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                      >
-                         <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
-                      </button>
+                  {/* Input Area - Fixed at Bottom of Column */}
+                  <div className="p-4 border-t border-white/5 bg-[#0a0a0a] w-full">
+                      <div className="relative w-full">
+                          <input 
+                              type="text" 
+                              value={inputText}
+                              onChange={(e) => setInputText(e.target.value)}
+                              onKeyDown={handleKeyPress}
+                              disabled={isTyping}
+                              placeholder={`Escreva algo em ${language.name}...`}
+                              className="w-full bg-[#151515] border border-white/10 rounded-xl pl-5 pr-12 py-4 text-white placeholder-gray-600 focus:outline-none focus:border-purple-500 transition-colors disabled:opacity-50"
+                          />
+                          <button 
+                            onClick={handleSendMessage}
+                            disabled={!inputText.trim() || isTyping}
+                            className="absolute right-2 top-2 bottom-2 aspect-square bg-white text-black rounded-lg flex items-center justify-center hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                          >
+                             <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
+                          </button>
+                      </div>
                   </div>
               </div>
+
           </div>
 
           {/* VIEW: VOICE (SPLIT SCREEN) */}
-          <div className={`absolute inset-0 flex flex-row transition-all duration-500 bg-black/50 backdrop-blur-3xl z-20 ${mode === 'voice' ? 'translate-x-0 opacity-100' : 'translate-x-full opacity-0 pointer-events-none'}`}>
+          <div className={`absolute inset-0 flex flex-row transition-all duration-300 bg-black/50 backdrop-blur-3xl z-20 ${mode === 'voice' ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}>
               
               {/* LEFT COLUMN: TRANSCRIPT */}
               <div className="w-1/2 md:w-5/12 border-r border-white/5 flex flex-col bg-[#0f0f0f]">
@@ -470,8 +587,7 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                   </div>
                   
                   <div className="flex-1 overflow-y-auto p-4 space-y-4">
-                      {/* Historic Messages */}
-                      {voiceMessages.map((msg) => (
+                      {getDisplayMessages().map((msg) => (
                           <div key={msg.id} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
                               <span className="text-[10px] text-gray-500 mb-1 px-1">{msg.role === 'user' ? 'Você' : language.name}</span>
                               <div className={`max-w-[90%] rounded-xl px-4 py-2 text-sm leading-relaxed ${
@@ -481,26 +597,19 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                               }`}>
                                   {msg.text}
                               </div>
+                              {/* CORRECTION DISPLAY */}
+                              {msg.role === 'user' && msg.correction && (
+                                <div className="mt-1 mr-1 max-w-[85%] bg-yellow-400/10 border border-yellow-400/20 rounded-lg p-2 text-xs text-yellow-200 animate-in fade-in slide-in-from-top-1">
+                                    <div className="flex items-start gap-2">
+                                        <span className="shrink-0 mt-0.5">⚠️</span>
+                                        <div>
+                                            {msg.correction}
+                                        </div>
+                                    </div>
+                                </div>
+                              )}
                           </div>
                       ))}
-
-                      {/* Current Live Pending Text - INTERLEAVED (No separate block) */}
-                      {currentLiveUserText && (
-                          <div className="flex flex-col items-end">
-                              <span className="text-[10px] text-gray-500 mb-1 px-1">Você (falando...)</span>
-                              <div className="max-w-[90%] rounded-xl px-4 py-2 text-sm text-white bg-purple-900/20 border border-purple-500/10 rounded-tr-none animate-pulse">
-                                  {currentLiveUserText}
-                              </div>
-                          </div>
-                      )}
-                      {currentLiveModelText && (
-                          <div className="flex flex-col items-start">
-                              <span className="text-[10px] text-gray-500 mb-1 px-1">{language.name} (falando...)</span>
-                              <div className="max-w-[90%] rounded-xl px-4 py-2 text-sm text-gray-300 bg-[#1a1a1a]/50 border border-white/5 rounded-tl-none animate-pulse">
-                                  {currentLiveModelText}
-                              </div>
-                          </div>
-                      )}
                       
                       <div ref={voiceScrollRef} />
                   </div>
