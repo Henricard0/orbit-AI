@@ -1,0 +1,7 @@
+{
+  "name": "Orbit Language AI",
+  "description": "An AI-powered language learning assistant offering real-time conversation practice and speech correction.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
