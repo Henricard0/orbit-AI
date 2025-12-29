@@ -26,9 +26,15 @@ const EXERCISES = [
   { id: 'grammar', label: '📖 Gramática: Passado', prompt: 'Me faça perguntas sobre o que eu fiz ontem para praticar o tempo passado.' },
 ];
 
+const VOICES = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Aoede', 'Zephyr'];
+
 export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
   const [mode, setMode] = useState<Mode>('chat');
   const [showExercises, setShowExercises] = useState(false);
+  
+  // Voice Selection State
+  const [selectedVoice, setSelectedVoice] = useState<string>(language.voiceName);
+  const [showVoices, setShowVoices] = useState(false);
 
   // --- CHAT STATE ---
   const [messages, setMessages] = useState<Message[]>([]);
@@ -68,6 +74,11 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const isConnectingRef = useRef(false);
+
+  // Visualizer Refs
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const visualizerCanvasRef = useRef<HTMLCanvasElement>(null);
+  const animationFrameRef = useRef<number | null>(null);
 
   // AI Client - Stable instance
   const ai = useMemo(() => new GoogleGenAI({ apiKey: process.env.API_KEY }), []);
@@ -140,6 +151,69 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
         role: 'user',
         text: `(Sugestão: Diga) "${prompt}"`
       }]);
+    }
+  };
+
+  // =========================================================
+  // LOGIC: VISUALIZER
+  // =========================================================
+  
+  const drawVisualizer = () => {
+    if (!analyserRef.current || !visualizerCanvasRef.current) return;
+    
+    const canvas = visualizerCanvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const bufferLength = analyserRef.current.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    analyserRef.current.getByteFrequencyData(dataArray);
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const centerX = canvas.width / 2;
+    const centerY = canvas.height / 2;
+    // Radius matches the avatar container size roughly
+    const radius = 90; 
+    
+    // We only use the lower frequencies for a better voice visualization
+    const bars = 40;
+    const step = Math.floor(bufferLength / bars);
+
+    ctx.beginPath();
+    for (let i = 0; i < bars; i++) {
+        const value = dataArray[i * step];
+        // Scale value to create bar height
+        const barHeight = (value / 255) * 50; 
+        
+        const angle = (Math.PI * 2 * i) / bars;
+        
+        // Circular placement
+        const x1 = centerX + Math.cos(angle) * radius;
+        const y1 = centerY + Math.sin(angle) * radius;
+        const x2 = centerX + Math.cos(angle) * (radius + barHeight);
+        const y2 = centerY + Math.sin(angle) * (radius + barHeight);
+
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+    }
+    
+    ctx.strokeStyle = '#22c55e'; // Green color matching active mic
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+
+    animationFrameRef.current = requestAnimationFrame(drawVisualizer);
+  };
+
+  const stopVisualizer = () => {
+    if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+    }
+    if (visualizerCanvasRef.current) {
+        const ctx = visualizerCanvasRef.current.getContext('2d');
+        ctx?.clearRect(0, 0, visualizerCanvasRef.current.width, visualizerCanvasRef.current.height);
     }
   };
 
@@ -241,8 +315,8 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
     }
   };
 
-  const connectToLive = async () => {
-    if (isConnectingRef.current || isConnected) return;
+  const connectToLive = async (voiceOverride?: string) => {
+    if (isConnectingRef.current || (isConnected && !voiceOverride)) return;
     
     try {
         await ensureAudioContexts();
@@ -261,34 +335,27 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
             config: {
                 responseModalities: [Modality.AUDIO],
                 speechConfig: {
-                    voiceConfig: { prebuiltVoiceConfig: { voiceName: language.voiceName } },
+                    voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceOverride || selectedVoice } },
                 },
                 systemInstruction: `
                   You are an expert native tutor of ${language.nativeName} teaching a student who speaks Portuguese.
 
-                  YOUR BEHAVIORAL RULES:
-                  1. **VERBAL CORRECTION (PRIORITY)**: 
-                     - If the user makes a pronunciation or grammar mistake, you MUST correct them verbally immediately at the start of your response.
-                     - Example: "Ah, cuidado. A pronúncia correta é [Correct Word], não [Wrong Word]." or "Dizemos [Correct Phrase]."
-                     - Do this politely but explicitly before continuing the conversation.
+                  YOUR INTERACTION FLOW (STRICT):
+                  
+                  1. **PRONUNCIATION FEEDBACK (MANDATORY START)**:
+                     - EVERY TIME the user speaks, listen specifically to their pronunciation and accent.
+                     - Start your response with a short phrase in **Portuguese** evaluating it.
+                     - If excellent: "Sua pronúncia foi perfeita!" or "Muito natural!"
+                     - If needs work: "Cuidado com o som do [Letra/Fonema], tente fazer mais suave." or "Atenção à palavra [Palavra]."
+                     - Keep this feedback under 5 seconds.
 
-                  2. **LANGUAGE SWITCHING**:
-                     - If the user asks to "explain in Portuguese" or "fale em português", you MUST switch to Portuguese immediately to provide the explanation. 
-                     - Do not just say "Sim, posso explicar". Actually provide the explanation in Portuguese.
+                  2. **CONVERSATION (IMMEDIATE FOLLOW-UP)**:
+                     - Immediately after the Portuguese feedback, switch back to **${language.nativeName}** and continue the conversation or roleplay naturally.
+                     - Do not wait. Flow seamlessly from the Portuguese tip to the Target Language response.
 
-                  3. **BILINGUAL MIXING**: 
-                     - Default to speaking ${language.nativeName} to immerse the student.
-                     - However, if the student is struggling or asks for help, use Portuguese to clarify concepts.
-                     - You can mix sentences like: "In ${language.nativeName}, we use this verb... (explanation in PT)... now try saying [phrase in ${language.nativeName}]."
-
-                  4. **EXERCISES & ROLEPLAY**:
-                     - If the user says "Vamos fazer um roleplay" or asks for an exercise:
-                     - **Roleplay**: Set the scene (e.g., Cafe, Hotel), define your role (e.g., Waiter), and start.
-                     - **Vocabulary**: Give a word, ask for the definition or translation.
-                     - **Pronunciation**: Give a tongue twister or difficult sentence.
-                     - Keep the turns short and interactive.
-
-                  5. **TONE**: Encouraging, patient, but strict about accuracy.
+                  ADDITIONAL RULES:
+                  - If the user asks to "explain in Portuguese", switch to Portuguese completely for that turn.
+                  - Be patient, encouraging, but precise with phonemes.
                 `,
                 inputAudioTranscription: {}, 
                 outputAudioTranscription: {}, 
@@ -298,11 +365,14 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                     setIsConnected(true);
                     setVoiceStatus('Conectado. Pode falar!');
                     isConnectingRef.current = false;
-                    setVoiceMessages([{
-                        id: 'start', 
-                        role: 'model', 
-                        text: `(Conectado) Olá! Eu sou sua tutora. Podemos falar em ${language.nativeName} ou Português.`
-                    }]);
+                    // Only add start message if it's the very first connection, not a voice switch
+                    if (voiceMessages.length === 0) {
+                        setVoiceMessages([{
+                            id: 'start', 
+                            role: 'model', 
+                            text: `(Conectado) Olá! Eu sou sua tutora. Podemos falar em ${language.nativeName} ou Português.`
+                        }]);
+                    }
                 },
                 onmessage: async (message: LiveServerMessage) => {
                     // --- 1. Audio Playback ---
@@ -404,9 +474,13 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                     }
                 },
                 onclose: () => {
-                    setIsConnected(false);
-                    setVoiceStatus('Desconectado');
-                    setIsMicOn(false);
+                    // Only treat as full disconnect if we aren't mid-switch
+                    if (!isConnectingRef.current) {
+                        setIsConnected(false);
+                        setVoiceStatus('Desconectado');
+                        setIsMicOn(false);
+                        stopVisualizer();
+                    }
                     isConnectingRef.current = false;
                 },
                 onerror: (err) => {
@@ -414,6 +488,7 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                     setVoiceError("Erro na conexão");
                     setIsConnected(false);
                     isConnectingRef.current = false;
+                    stopVisualizer();
                 }
             }
         });
@@ -442,6 +517,11 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
             scriptProcessorRef.current.disconnect();
             scriptProcessorRef.current = null;
         }
+        if (analyserRef.current) {
+            analyserRef.current.disconnect();
+            analyserRef.current = null;
+        }
+        stopVisualizer();
         setIsMicOn(false);
         setVoiceStatus("Microfone pausado");
     } else {
@@ -452,6 +532,15 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
             if (!inputAudioContextRef.current) return;
 
             const source = inputAudioContextRef.current.createMediaStreamSource(stream);
+            
+            // --- VISUALIZER SETUP ---
+            const analyser = inputAudioContextRef.current.createAnalyser();
+            analyser.fftSize = 256; // Defines data detail
+            source.connect(analyser);
+            analyserRef.current = analyser;
+            drawVisualizer(); // Start Animation Loop
+
+            // --- PROCESSOR SETUP ---
             const processor = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
             
             processor.onaudioprocess = (e) => {
@@ -470,6 +559,7 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
             source.connect(processor);
             processor.connect(inputAudioContextRef.current.destination);
             scriptProcessorRef.current = processor;
+            
             setIsMicOn(true);
             setVoiceStatus("Ouvindo...");
         } catch (err) {
@@ -479,23 +569,48 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
     }
   };
 
-  const disconnectVoice = () => {
+  const disconnectVoice = (clearHistory = true) => {
+      stopVisualizer();
       if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
       if (inputAudioContextRef.current) inputAudioContextRef.current.close();
       if (outputAudioContextRef.current) outputAudioContextRef.current.close();
       inputAudioContextRef.current = null;
       outputAudioContextRef.current = null;
+      analyserRef.current = null;
       setIsConnected(false);
       setIsMicOn(false);
-      setVoiceMessages([]);
-      liveUserTextRef.current = '';
-      liveModelTextRef.current = '';
-      setCurrentLiveUserText('');
-      setCurrentLiveModelText('');
+      if (clearHistory) {
+        setVoiceMessages([]);
+        liveUserTextRef.current = '';
+        liveModelTextRef.current = '';
+        setCurrentLiveUserText('');
+        setCurrentLiveModelText('');
+      }
+  };
+  
+  const handleVoiceChange = async (voice: string) => {
+      setSelectedVoice(voice);
+      setShowVoices(false);
+      
+      if (isConnected) {
+          // Soft disconnect - close session but keep history
+          setVoiceStatus('Trocando voz...');
+          setIsConnected(false);
+          stopVisualizer(); // Stop visualizer during switch
+          
+          if (liveSessionRef.current) {
+             liveSessionRef.current.then((s: any) => s.close());
+          }
+          if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+          
+          // Reconnect with new voice after brief delay
+          setTimeout(() => connectToLive(voice), 500);
+      }
   };
 
   useEffect(() => {
     return () => {
+       stopVisualizer();
        if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
        if (inputAudioContextRef.current) inputAudioContextRef.current.close();
        if (outputAudioContextRef.current) outputAudioContextRef.current.close();
@@ -504,7 +619,7 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
 
   const switchMode = (newMode: Mode) => {
       if (newMode === 'chat') {
-          disconnectVoice();
+          disconnectVoice(true);
       }
       setMode(newMode);
   };
@@ -542,6 +657,40 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
           
           {/* Controls */}
           <div className="flex items-center gap-3">
+              
+              {/* Voice Selection (Only in Voice Mode) */}
+              {mode === 'voice' && (
+                  <div className="relative">
+                    <button 
+                      onClick={() => setShowVoices(!showVoices)}
+                      className={`h-9 px-3 rounded-full transition-all border flex items-center gap-2 text-xs font-bold uppercase tracking-wider ${showVoices ? 'bg-white text-black border-white' : 'bg-black/40 text-gray-400 border-white/10 hover:text-white'}`}
+                      title="Selecionar Voz"
+                    >
+                        <span>{selectedVoice}</span>
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform ${showVoices ? 'rotate-180' : ''}`}><path d="m6 9 6 6 6-6"/></svg>
+                    </button>
+                    
+                    {showVoices && (
+                       <div className="absolute top-full right-0 mt-3 w-40 bg-[#1a1a1a] border border-white/10 rounded-xl shadow-2xl p-1 z-50 animate-in fade-in zoom-in-95 overflow-hidden">
+                          {VOICES.map(voice => (
+                              <button
+                                 key={voice}
+                                 onClick={() => handleVoiceChange(voice)}
+                                 className={`w-full text-left px-3 py-2 rounded-lg text-xs font-bold transition-colors flex items-center justify-between ${selectedVoice === voice ? 'bg-white/10 text-white' : 'text-gray-400 hover:bg-white/5 hover:text-gray-200'}`}
+                              >
+                                 {voice}
+                                 {selectedVoice === voice && <div className="w-1.5 h-1.5 rounded-full bg-green-500"></div>}
+                              </button>
+                          ))}
+                       </div>
+                    )}
+                    {/* Overlay */}
+                    {showVoices && (
+                        <div className="fixed inset-0 z-40 bg-transparent" onClick={() => setShowVoices(false)}></div>
+                    )}
+                  </div>
+              )}
+
               {/* Exercise Menu */}
               <div className="relative">
                 <button 
@@ -704,7 +853,7 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                          <div className={`absolute inset-0 rounded-full border border-white/10 scale-150 ${isMicOn ? 'animate-ping opacity-20' : 'opacity-0'}`}></div>
                          <div className={`absolute inset-0 rounded-full border border-white/5 scale-[2] ${isMicOn ? 'animate-pulse opacity-10' : 'opacity-0'}`}></div>
                          
-                         <div className={`w-32 h-32 md:w-48 md:h-48 rounded-full flex items-center justify-center relative overflow-hidden transition-all duration-500 border-4 ${
+                         <div className={`w-32 h-32 md:w-48 md:h-48 rounded-full flex items-center justify-center relative transition-all duration-500 border-4 ${
                              isAiSpeaking 
                                 ? 'border-blue-500 shadow-[0_0_50px_rgba(59,130,246,0.6)]' 
                                 : isMicOn 
@@ -713,6 +862,14 @@ export const LiveTutor: React.FC<LiveTutorProps> = ({ language, onExit }) => {
                                         ? 'border-purple-500' 
                                         : 'border-gray-700'
                          }`}>
+                             {/* AUDIO VISUALIZER CANVAS - Overlaid, circular clip handled by parent overflow-hidden */}
+                             <canvas 
+                                ref={visualizerCanvasRef} 
+                                width={400} 
+                                height={400} 
+                                className={`absolute inset-0 w-full h-full z-20 pointer-events-none transition-opacity duration-500 ${isMicOn && !isAiSpeaking ? 'opacity-100' : 'opacity-0'}`}
+                             />
+
                              <img src={language.image} className="absolute inset-0 w-full h-full object-cover opacity-60 hover:opacity-100 transition-opacity" />
                              <div className={`absolute inset-0 bg-gradient-to-t from-black via-transparent to-transparent opacity-80`}></div>
                              
